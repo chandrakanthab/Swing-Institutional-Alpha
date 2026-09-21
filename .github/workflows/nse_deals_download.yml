@@ -1,0 +1,29 @@
+name: NSE Deals Download
+
+on:
+  schedule:
+    # 6:00 PM IST = 12:30 PM UTC (IST = UTC+5:30)
+    # Runs Mon-Fri (1-5 in cron = Monday-Friday)
+    - cron: '30 12 * * 1-5'
+  workflow_dispatch:  # Allow manual trigger from GitHub Actions tab
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Download NSE deals and upload to DBFS
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: python scripts/nse_bulk_deals_downloader.py
