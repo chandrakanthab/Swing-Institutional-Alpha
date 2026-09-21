@@ -34,6 +34,7 @@ VOLUME_UPLOAD_PATH = "/Volumes/workspace/bronze_swing/deals_uploads"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ── NSE URLs ─────────────────────────────────────────────────────────────────
+# Live CSV URLs — ONLY work for today's trading data (no date in filename)
 NSE_BULK_URLS = [
     "https://nsearchives.nseindia.com/archives/equities/bulkdeals/bulk.csv",
     "https://www.nseindia.com/archives/equities/bulkdeals/bulk.csv",
@@ -42,9 +43,15 @@ NSE_BLOCK_URLS = [
     "https://nsearchives.nseindia.com/archives/equities/blockdeals/block.csv",
     "https://www.nseindia.com/archives/equities/blockdeals/block.csv",
 ]
+
+# Historical API endpoints — for past trading dates (from/to format: DD-MM-YYYY)
+NSE_BULK_HISTORY_API  = "https://www.nseindia.com/api/historical/bulk-deals"
+NSE_BLOCK_HISTORY_API = "https://www.nseindia.com/api/historical/block-deals"
+
 NSE_NIFTY50_API = "https://www.nseindia.com/api/historical/indices"
 NSE_NIFTY50_INDEX_TYPE = "NIFTY 50"
 
+# Headers for browsing NSE pages (session priming)
 NSE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,6 +63,13 @@ NSE_HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Referer":         "https://www.nseindia.com/",
     "Connection":      "keep-alive",
+}
+
+# Headers for NSE API calls (JSON responses)
+NSE_API_HEADERS = {
+    **NSE_HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.nseindia.com/reports/bulk-deals",
 }
 
 
@@ -172,6 +186,89 @@ def download_csv(session: requests.Session, urls: list, label: str) -> bytes:
     raise RuntimeError(f"All download attempts failed for {label}")
 
 
+def download_deals_historical(session: requests.Session, api_url: str, target_date: date, label: str) -> bytes:
+    """Download bulk/block deals from NSE historical API for a past trading date.
+
+    Uses https://www.nseindia.com/api/historical/bulk-deals (or block-deals)
+    with from/to date params. Returns CSV bytes.
+    """
+    import csv as csv_mod
+
+    date_str = target_date.strftime("%d-%m-%Y")
+    params = {"from": date_str, "to": date_str}
+
+    # Use API headers for JSON responses
+    api_session = requests.Session()
+    api_session.headers.update(NSE_API_HEADERS)
+    api_session.cookies.update(session.cookies)
+
+    for attempt in range(1, 4):
+        try:
+            resp = api_session.get(api_url, params=params, timeout=30)
+            if resp.status_code == 403:
+                print(f"   [{label}] 403 on attempt {attempt} — refreshing session...")
+                prime_nse_session(api_session)
+                time.sleep(random.uniform(3, 5))
+                continue
+            if resp.status_code == 404:
+                print(f"   [{label}] 404 — no records for {date_str}")
+                raise RuntimeError(f"No {label} records for {target_date} (404)")
+            resp.raise_for_status()
+
+            # Check if response is actually JSON
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" not in content_type and not resp.text.strip().startswith("{"):
+                print(f"   [{label}] Non-JSON response (Content-Type: {content_type}), retrying...")
+                prime_nse_session(api_session)
+                time.sleep(random.uniform(3, 5))
+                continue
+
+            data = resp.json()
+
+            # Extract records from NSE API response
+            records = None
+            if isinstance(data, list):
+                records = data if len(data) > 0 else None
+            elif isinstance(data, dict):
+                for key in ["data", "Data", "DATA", label, label.lower()]:
+                    if key in data:
+                        val = data[key]
+                        if val and isinstance(val, list):
+                            records = val
+                            break
+
+            if not records:
+                print(f"   [{label}] No records returned for {target_date}")
+                raise RuntimeError(f"No {label} records for {target_date}")
+
+            # Convert JSON records to CSV
+            df_data = records
+            if isinstance(df_data[0], dict):
+                output = io.StringIO()
+                writer = csv_mod.DictWriter(output, fieldnames=df_data[0].keys())
+                writer.writeheader()
+                writer.writerows(df_data)
+                csv_bytes = output.getvalue().encode("utf-8")
+                print(f"   [{label}] API returned {len(records)} records, CSV {len(csv_bytes)} bytes")
+                return csv_bytes
+            else:
+                raise RuntimeError(f"Unexpected record format from {label} API")
+
+        except requests.exceptions.Timeout:
+            print(f"   [{label}] Timeout attempt {attempt}")
+            time.sleep(2)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            if attempt < 3:
+                print(f"   [{label}] Error attempt {attempt}: {e}")
+                time.sleep(2)
+            else:
+                raise
+
+    raise RuntimeError(f"All {label} historical API attempts failed")
+
+
 def download_nifty50(session: requests.Session, target_date: date) -> bytes:
     """Download Nifty 50 index data from NSE historical indices API.
 
@@ -184,17 +281,30 @@ def download_nifty50(session: requests.Session, target_date: date) -> bytes:
     params = {
         "from": date_str,
         "to": date_str,
-        "index_type": NSE_NIFTY50_INDEX_TYPE,
+        "indexType": NSE_NIFTY50_INDEX_TYPE,
     }
+
+    api_session = requests.Session()
+    api_session.headers.update(NSE_API_HEADERS)
+    api_session.cookies.update(session.cookies)
 
     for attempt in range(1, 4):
         try:
-            resp = session.get(NSE_NIFTY50_API, params=params, timeout=30)
+            resp = api_session.get(NSE_NIFTY50_API, params=params, timeout=30)
             if resp.status_code == 403:
-                print(f"   [NIFTY50] 403 on attempt {attempt} — retrying...")
+                print(f"   [NIFTY50] 403 on attempt {attempt} — refreshing session...")
+                prime_nse_session(api_session)
                 time.sleep(random.uniform(3, 5))
                 continue
             resp.raise_for_status()
+
+            # Check if response is actually JSON (NSE can return HTML block pages)
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" not in content_type and not resp.text.strip().startswith("{"):
+                print(f"   [NIFTY50] Non-JSON response (Content-Type: {content_type}), retrying...")
+                prime_nse_session(api_session)
+                time.sleep(random.uniform(3, 5))
+                continue
 
             data = resp.json()
             records = data.get("data", [])
@@ -323,12 +433,19 @@ def main():
     session.headers.update(NSE_HEADERS)
     prime_nse_session(session)
 
+    is_historical = (today != effective_date)
+    if is_historical:
+        print("   (Historical date — will use NSE historical API endpoints)")
+
     results  = {}
     failures = []
 
     print(f"\nBulk deals ({ddmmyyyy}):")
     try:
-        bulk_content   = download_csv(session, NSE_BULK_URLS, "BULK")
+        if is_historical:
+            bulk_content = download_deals_historical(session, NSE_BULK_HISTORY_API, effective_date, "BULK")
+        else:
+            bulk_content = download_csv(session, NSE_BULK_URLS, "BULK")
         bulk_vol_path  = f"{VOLUME_UPLOAD_PATH}/bulk_{ddmmyyyy}.csv"
         upload_to_volume(bulk_content, bulk_vol_path)
         results["bulk"] = "SUCCESS"
@@ -341,7 +458,10 @@ def main():
 
     print(f"\nBlock deals ({ddmmyyyy}):")
     try:
-        block_content   = download_csv(session, NSE_BLOCK_URLS, "BLOCK")
+        if is_historical:
+            block_content = download_deals_historical(session, NSE_BLOCK_HISTORY_API, effective_date, "BLOCK")
+        else:
+            block_content = download_csv(session, NSE_BLOCK_URLS, "BLOCK")
         block_vol_path  = f"{VOLUME_UPLOAD_PATH}/block_{ddmmyyyy}.csv"
         upload_to_volume(block_content, block_vol_path)
         results["block"] = "SUCCESS"
