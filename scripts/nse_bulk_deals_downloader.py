@@ -51,6 +51,12 @@ NSE_BLOCK_HISTORY_API = "https://www.nseindia.com/api/historical/block-deals"
 NSE_NIFTY50_API = "https://www.nseindia.com/api/historical/indices"
 NSE_NIFTY50_INDEX_TYPE = "NIFTY 50"
 
+# Yahoo Finance for Nifty 50 (reliable — not blocked by anti-bot protection)
+YAHOO_NIFTY50_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI"
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+}
+
 # Headers for browsing NSE pages (session priming)
 NSE_HEADERS = {
     "User-Agent": (
@@ -270,93 +276,74 @@ def download_deals_historical(session: requests.Session, api_url: str, target_da
 
 
 def download_nifty50(session: requests.Session, target_date: date) -> bytes:
-    """Download Nifty 50 index data from NSE historical indices API.
+    """Download Nifty 50 index data from Yahoo Finance API.
 
-    Calls the API for target_date, parses JSON, converts to CSV.
-    Returns CSV bytes.
+    Uses Yahoo Finance chart API for ^NSEI (Nifty 50 index).
+    Returns CSV bytes with columns: TRADE_DATE, OPEN, HIGH, LOW, CLOSE, VOLUME.
     """
     import csv as csv_mod
 
-    date_str = target_date.strftime("%d-%m-%Y")
-    params = {
-        "from": date_str,
-        "to": date_str,
-        "indexType": NSE_NIFTY50_INDEX_TYPE,
-    }
+    # Yahoo Finance uses Unix timestamps (UTC)
+    dt_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc)
+    period1 = int(dt_start.timestamp())
+    period2 = int((dt_start + timedelta(days=1)).timestamp())
 
-    api_session = requests.Session()
-    api_session.headers.update(NSE_API_HEADERS)
-    api_session.cookies.update(session.cookies)
+    params = {
+        "period1": period1,
+        "period2": period2,
+        "interval": "1d",
+    }
 
     for attempt in range(1, 4):
         try:
-            resp = api_session.get(NSE_NIFTY50_API, params=params, timeout=30)
-            if resp.status_code == 403:
-                print(f"   [NIFTY50] 403 on attempt {attempt} — refreshing session...")
-                prime_nse_session(api_session)
-                time.sleep(random.uniform(3, 5))
-                continue
+            resp = requests.get(YAHOO_NIFTY50_URL, params=params, timeout=15, headers=YAHOO_HEADERS)
             resp.raise_for_status()
 
-            # Check if response is actually JSON (NSE can return HTML block pages)
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" not in content_type and not resp.text.strip().startswith("{"):
-                print(f"   [NIFTY50] Non-JSON response (Content-Type: {content_type}), retrying...")
-                prime_nse_session(api_session)
-                time.sleep(random.uniform(3, 5))
-                continue
-
             data = resp.json()
-            records = data.get("data", [])
+            result = data.get("chart", {}).get("result", [])
 
-            if not records:
-                print(f"   [NIFTY50] No data returned for {target_date}")
+            if not result:
+                print(f"   [NIFTY50] No result from Yahoo Finance for {target_date}")
                 raise RuntimeError(f"No Nifty 50 data for {target_date}")
 
-            # Convert JSON records to CSV
-            FIELD_MAP = {
-                "TIMESTAMP": "TRADE_DATE",
-                "EOD_OPEN_INDEX_VAL": "OPEN",
-                "OPEN": "OPEN",
-                "EOD_HIGH_INDEX_VAL": "HIGH",
-                "HIGH": "HIGH",
-                "EOD_LOW_INDEX_VAL": "LOW",
-                "LOW": "LOW",
-                "EOD_CLOSE_INDEX_VAL": "CLOSE",
-                "CLOSE": "CLOSE",
-                "PREV_CLOSE": "PREV_CLOSE",
-                "PREVCLOSE": "PREV_CLOSE",
-                "VOLUME": "VOLUME",
-                "TURNOVER": "TURNOVER",
-                "TURNOVER_LACS": "TURNOVER",
-            }
+            chart_data = result[0]
+            timestamps = chart_data.get("timestamp", [])
+            quote = chart_data.get("indicators", {}).get("quote", [{}])[0]
 
-            CSV_HEADERS = ["TRADE_DATE", "OPEN", "HIGH", "LOW", "CLOSE", "PREV_CLOSE", "VOLUME", "TURNOVER"]
+            if not timestamps:
+                print(f"   [NIFTY50] No timestamps for {target_date}")
+                raise RuntimeError(f"No Nifty 50 data for {target_date}")
 
+            # Build CSV from Yahoo Finance response
+            CSV_HEADERS = ["TRADE_DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]
             output = io.StringIO()
             writer = csv_mod.DictWriter(output, fieldnames=CSV_HEADERS)
             writer.writeheader()
 
-            for rec in records:
-                row = {}
-                for api_key, csv_col in FIELD_MAP.items():
-                    if api_key in rec and csv_col not in row:
-                        row[csv_col] = rec[api_key]
-                for col in CSV_HEADERS:
-                    if col not in row:
-                        row[col] = ""
-                writer.writerow(row)
+            for i, ts in enumerate(timestamps):
+                trade_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                writer.writerow({
+                    "TRADE_DATE": trade_date,
+                    "OPEN":   quote.get("open", [None])[i] or "",
+                    "HIGH":   quote.get("high", [None])[i] or "",
+                    "LOW":    quote.get("low", [None])[i] or "",
+                    "CLOSE":  quote.get("close", [None])[i] or "",
+                    "VOLUME": quote.get("volume", [None])[i] or "",
+                })
 
             csv_bytes = output.getvalue().encode("utf-8")
-            print(f"   [NIFTY50] API returned {len(records)} records, CSV {len(csv_bytes)} bytes")
+            print(f"   [NIFTY50] Yahoo Finance returned {len(timestamps)} record(s), CSV {len(csv_bytes)} bytes")
             return csv_bytes
 
         except requests.exceptions.Timeout:
             print(f"   [NIFTY50] Timeout attempt {attempt}")
             time.sleep(2)
         except Exception as e:
-            print(f"   [NIFTY50] Error attempt {attempt}: {e}")
-            time.sleep(2)
+            if attempt < 3:
+                print(f"   [NIFTY50] Error attempt {attempt}: {e}")
+                time.sleep(2)
+            else:
+                raise
 
     raise RuntimeError("All Nifty 50 download attempts failed")
 
@@ -443,7 +430,11 @@ def main():
     print(f"\nBulk deals ({ddmmyyyy}):")
     try:
         if is_historical:
-            bulk_content = download_deals_historical(session, NSE_BULK_HISTORY_API, effective_date, "BULK")
+            print("   [BULK] Historical date — NSE API is blocked from GitHub Actions.")
+            print("   [BULK] For historical bulk deals, download manually from:")
+            print("   [BULK]   https://www.nseindia.com/reports/bulk-deals (browser only)")
+            print("   [BULK]   Upload CSV to UC Volume as bulk_" + ddmmyyyy + ".csv")
+            raise RuntimeError("Historical bulk deals not available via API (NSE anti-bot block)")
         else:
             bulk_content = download_csv(session, NSE_BULK_URLS, "BULK")
         bulk_vol_path  = f"{VOLUME_UPLOAD_PATH}/bulk_{ddmmyyyy}.csv"
@@ -459,7 +450,11 @@ def main():
     print(f"\nBlock deals ({ddmmyyyy}):")
     try:
         if is_historical:
-            block_content = download_deals_historical(session, NSE_BLOCK_HISTORY_API, effective_date, "BLOCK")
+            print("   [BLOCK] Historical date — NSE API is blocked from GitHub Actions.")
+            print("   [BLOCK] For historical block deals, download manually from:")
+            print("   [BLOCK]   https://www.nseindia.com/reports/block-deals (browser only)")
+            print("   [BLOCK]   Upload CSV to UC Volume as block_" + ddmmyyyy + ".csv")
+            raise RuntimeError("Historical block deals not available via API (NSE anti-bot block)")
         else:
             block_content = download_csv(session, NSE_BLOCK_URLS, "BLOCK")
         block_vol_path  = f"{VOLUME_UPLOAD_PATH}/block_{ddmmyyyy}.csv"
